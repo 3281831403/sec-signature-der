@@ -1,0 +1,1 @@
+"""Strict signature encoding helpers."""
