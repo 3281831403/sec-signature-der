@@ -4,6 +4,10 @@ The public API works with complete DER values.  ``parse_tlv`` returns one
 tag-length-value record, ``decode_int`` and ``decode_signature`` consume
 complete encoded values, and the ``encode_*`` functions return complete DER
 values ready to be transmitted.
+
+Every decoder is strict: a value has exactly one legal DER encoding.  Any
+padding, non-minimal integer, mismatched length field or extra element is
+rejected with an exception instead of being normalized and accepted.
 """
 
 from __future__ import annotations
@@ -37,14 +41,13 @@ def _read_length(data: bytes, offset: int) -> tuple[int, int]:
     if count == 0:
         raise ValueError("indefinite length is not allowed")
     raw = data[offset : offset + count]
-    if not raw:
-        length = 0
-    else:
-        if raw[0] == 0:
-            raise ValueError("length field has a leading zero")
-        length = int.from_bytes(raw, "big")
-        if length < 0x80:
-            raise ValueError("length field is not minimally encoded")
+    if len(raw) != count:
+        raise ValueError("truncated length field")
+    if raw[0] == 0:
+        raise ValueError("length field has a leading zero")
+    length = int.from_bytes(raw, "big")
+    if length < 0x80:
+        raise ValueError("length field is not minimally encoded")
     return length, offset + count
 
 
@@ -66,7 +69,8 @@ def parse_tlv(data: bytes, offset: int) -> dict[str, Any]:
     """Parse the tag-length-value record starting at *offset*.
 
     The returned mapping contains ``tag``, ``length``, ``value``, ``start``,
-    ``value_offset`` and ``end``.
+    ``value_offset`` and ``end``.  The declared length must match the bytes
+    actually present; a truncated value is rejected.
     """
     data = _as_bytes(data)
     if not isinstance(offset, int) or isinstance(offset, bool):
@@ -76,19 +80,33 @@ def parse_tlv(data: bytes, offset: int) -> dict[str, Any]:
 
     tag = data[offset]
     length, value_offset = _read_length(data, offset + 1)
-    value = data[value_offset : value_offset + length]
+    end = value_offset + length
+    if end > len(data):
+        raise ValueError("length field exceeds the available data")
+    value = data[value_offset:end]
     return {
         "tag": tag,
         "length": length,
         "value": value,
         "start": offset,
         "value_offset": value_offset,
-        "end": value_offset + length,
+        "end": end,
     }
 
 
+def _integer_issue(body: bytes) -> str | None:
+    """Return a description of the DER INTEGER problem, or None when minimal."""
+    if not body:
+        return "INTEGER value is empty"
+    if len(body) > 1 and body[0] == 0x00 and body[1] < 0x80:
+        return "INTEGER has leading zero padding"
+    if len(body) > 1 and body[0] == 0xFF and body[1] >= 0x80:
+        return "INTEGER has a non-minimal negative encoding"
+    return None
+
+
 def decode_int(data: bytes) -> int:
-    """Decode one complete DER INTEGER value."""
+    """Decode one complete, minimally encoded DER INTEGER value."""
     data = _as_bytes(data)
     item = parse_tlv(data, 0)
     if item["tag"] != _TAG_INTEGER:
@@ -97,19 +115,24 @@ def decode_int(data: bytes) -> int:
         raise ValueError("trailing data after INTEGER")
 
     body = item["value"]
-    if not body:
-        raise ValueError("INTEGER value is empty")
-    if body[0] & 0x80:
-        return -int.from_bytes(body, "big")
-    return int.from_bytes(body, "big")
+    issue = _integer_issue(body)
+    if issue is not None:
+        raise ValueError(issue)
+    return int.from_bytes(body, "big", signed=True)
 
 
 def decode_signature(data: bytes) -> dict[str, Any]:
-    """Decode a DER SEQUENCE containing two INTEGER values."""
+    """Decode a DER SEQUENCE containing exactly two INTEGER values.
+
+    The sequence must fill the whole input, both elements must be INTEGERs
+    with minimal encodings, and no third element is permitted.
+    """
     data = _as_bytes(data)
     sequence = parse_tlv(data, 0)
     if sequence["tag"] != _TAG_SEQUENCE:
         raise ValueError("signature must be a SEQUENCE")
+    if sequence["end"] != len(data):
+        raise ValueError("trailing data after the SEQUENCE")
 
     payload = sequence["value"]
     first = parse_tlv(payload, 0)
@@ -117,26 +140,36 @@ def decode_signature(data: bytes) -> dict[str, Any]:
         raise ValueError("first signature element must be an INTEGER")
     r = decode_int(payload[first["start"] : first["end"]])
 
+    if first["end"] >= len(payload):
+        raise ValueError("SEQUENCE must contain exactly two INTEGER values")
     second = parse_tlv(payload, first["end"])
     if second["tag"] != _TAG_INTEGER:
         raise ValueError("second signature element must be an INTEGER")
     s = decode_int(payload[second["start"] : second["end"]])
 
+    if second["end"] != len(payload):
+        raise ValueError("SEQUENCE must contain exactly two INTEGER values")
+
     return {"r": r, "s": s, "end": sequence["end"]}
 
 
 def encode_int(value: int) -> bytes:
-    """Encode an integer as a DER INTEGER value."""
+    """Encode an integer as a minimal DER INTEGER value."""
     if not isinstance(value, int) or isinstance(value, bool):
         raise TypeError("value must be an integer")
 
-    if value >= 0:
-        width = max(1, (value.bit_length() + 7) // 8)
-        body = b"\x00" + value.to_bytes(width, "big")
+    if value == 0:
+        body = b"\x00"
+    elif value > 0:
+        body = value.to_bytes((value.bit_length() + 7) // 8, "big")
+        if body[0] & 0x80:
+            body = b"\x00" + body
     else:
         magnitude = -value
         width = max(1, (magnitude.bit_length() + 7) // 8)
-        body = b"\x80" + magnitude.to_bytes(width, "big")
+        if magnitude > (1 << (8 * width - 1)):
+            width += 1
+        body = value.to_bytes(width, "big", signed=True)
     return _tlv(_TAG_INTEGER, body)
 
 
@@ -160,30 +193,21 @@ def _signature_values(message: Any, key: Any) -> tuple[int, int]:
 def verify_signature(sig: bytes, message: Any, key: Any) -> bool:
     """Verify *sig* for *message* under *key*.
 
-    The expected pair is derived from the keyed message digest and compared
-    with the supplied signature.  Malformed input is reported as a failed
-    verification rather than an exception.
+    Verification is performed against the encoded bytes: the supplied
+    signature must first parse as strict DER and then equal the unique
+    canonical encoding of the expected pair.  A padded or otherwise
+    non-minimal variant is rejected, never normalized into acceptance.
+    Malformed input is reported as a failed verification rather than an
+    exception.
     """
     try:
         data = _as_bytes(sig)
-        decoded = decode_signature(data)
-        if decoded["r"] == 0 and decoded["s"] == 0:
-            return False
-        normalized = decode_signature(encode_signature(decoded["r"], decoded["s"]))
+        decode_signature(data)
         expected_r, expected_s = _signature_values(message, key)
-        return normalized["r"] == expected_r and normalized["s"] == expected_s
+        expected = encode_signature(expected_r, expected_s)
+        return hmac.compare_digest(data, expected)
     except (TypeError, ValueError, IndexError):
         return False
-
-
-def _integer_issue(body: bytes) -> str | None:
-    if not body:
-        return "INTEGER value is empty"
-    if len(body) > 1 and body[0] == 0x00 and body[1] < 0x80:
-        return "INTEGER has leading zero padding"
-    if len(body) > 1 and body[0] == 0xFF and body[1] >= 0x80:
-        return "INTEGER has a non-minimal negative encoding"
-    return None
 
 
 def validate_encoding(sig: bytes) -> list[str]:
@@ -253,24 +277,21 @@ def sig_batch(items: Any) -> dict[str, Any]:
     """Verify a batch of signatures and summarize the outcome.
 
     Each item is a mapping with ``sig``, ``message`` and ``key`` keys, or a
-    three-item sequence in that order.  The result has ``results``, ``valid``,
-    ``invalid`` and ``total`` keys.
+    three-item sequence in that order.  Every signature is decoded and
+    verified independently; no item's result is reused for another.  The
+    result has ``results``, ``valid``, ``invalid`` and ``total`` keys.
     """
     results: list[bool] = []
-    cached: dict[str, Any] | None = None
 
     for raw_item in items:
         try:
             sig, message, key = _batch_item(raw_item)
-            if cached is None:
-                cached = decode_signature(_as_bytes(sig))
-            expected_r, expected_s = _signature_values(message, key)
-            ok = cached["r"] == expected_r and cached["s"] == expected_s
+            ok = verify_signature(sig, message, key)
         except (TypeError, ValueError, IndexError):
             ok = False
         results.append(bool(ok))
 
-    valid = sum(1 for item in results if item)
+    valid = sum(results)
     return {
         "results": results,
         "valid": valid,
